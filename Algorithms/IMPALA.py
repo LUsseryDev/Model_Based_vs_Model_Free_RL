@@ -19,7 +19,7 @@ class NeuralNet(torch.nn.Module):
             torch.nn.Conv2d(in_channels=16, out_channels=32, kernel_size=4, stride=2),
             torch.nn.ReLU(),
             torch.nn.Flatten(1),
-            torch.nn.Linear(in_features=5632, out_features=256), #going to be wrong input features
+            torch.nn.Linear(in_features=5632, out_features=256),
             torch.nn.ReLU(),
             torch.nn.Linear(in_features=256, out_features=256),
             torch.nn.ReLU(),
@@ -32,9 +32,10 @@ class NeuralNet(torch.nn.Module):
 def actor(game:str, tqueue: mp.Queue, mqueue: mp.Queue, is_done:mp.Event(), is_paused:mp.Event(), trajectory_length:int, stack_n_frames:int, n_action_repeats:int):
     process = mp.current_process()
     print("starting actor with pid "+str(process.pid))
-    env = EnvUtil.getEnvList([game])[0]
-    network = NeuralNet(stack_n_frames, env.action_space.n)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    env = EnvUtil.getEnvList([game])[0]
+    network = NeuralNet(stack_n_frames, env.action_space.n).to(device)
+
 
     frame, info = env.reset()
     preprocessor = Preprocessor(frame, stack_n_frames)
@@ -57,8 +58,12 @@ def actor(game:str, tqueue: mp.Queue, mqueue: mp.Queue, is_done:mp.Event(), is_p
         for i in range(trajectory_length):
             # get action
             with torch.no_grad():
-                action_probs = network.forward(torch.from_numpy(obs).float().unsqueeze(0)).detach()
-                action = torch.multinomial(torch.nn.functional.softmax(action_probs, dim=1), 1)
+                action_probs = network.forward(torch.from_numpy(obs).float().unsqueeze(0).to(device)).cpu().detach()
+                try: action = torch.multinomial(torch.nn.functional.softmax(action_probs, dim=1), 1)
+                except:
+                    print("broke")
+                    print(action_probs)
+                    raise RuntimeError
 
             # run action and save to trajectory
             for j in range(n_action_repeats - 1):
@@ -110,8 +115,8 @@ def learner(v_network:NeuralNet, p_network:NeuralNet, game:str, tqueue: mp.Queue
 
     #hyperparamters
     #move these somewhere else
-    rho = 1
-    c = 1
+    rho_threshold = 1
+    c_threshold = 1
     value_loss_scaler = 1
     policy_loss_scaler = 1
     entropy_loss_scaler = 1
@@ -153,11 +158,11 @@ def learner(v_network:NeuralNet, p_network:NeuralNet, game:str, tqueue: mp.Queue
 
         #do some learning
         values = [v_network(obs.select(1, j)) for j in range(trajectory_length)]
-        learner_probs = [p_network(obs.select(1, j)) for j in range(trajectory_length)]
+        learner_logits = [p_network(obs.select(1, j)) for j in range(trajectory_length)]
 
-        learner_probs = torch.stack(learner_probs, dim=1).to(device)
+        learner_logits = torch.stack(learner_logits, dim=1).to(device)
 
-        #print("learner: " + str(learner_probs.select(1, 0).shape))
+        #print("learner: " + str(learner_logits.select(1, 0).shape))
 
         #used to start recursive v-trace calcs
         next_v_trace = values[-1]
@@ -166,33 +171,41 @@ def learner(v_network:NeuralNet, p_network:NeuralNet, game:str, tqueue: mp.Queue
         values_plus1.append(values[-1])
         values_plus1 = torch.stack(values_plus1, dim=1).to(device)
 
+        advantages = []
+
         #calculate V-trace targets and losses
         for t in reversed(range(trajectory_length)):
-            ratio = learner_probs.select(1, t).gather(1, action.select(1, t)) / actor_logits.select(1, t).gather(1, action.select(1, t))
-            rho_t = torch.clamp(ratio, max=rho)
-            cs = torch.clamp(ratio, max=c)
+            ratio = F.log_softmax(learner_logits, dim=-1).select(1, t).gather(1, action.select(1, t)) / F.log_softmax(actor_logits, dim=-1).select(1, t).gather(1, action.select(1, t))
+            rho_t = torch.clamp(ratio, max=rho_threshold)
+            cs = torch.clamp(ratio, max=c_threshold)
             delta = rho_t *(reward.select(1,t) + gamma*values_plus1.select(1, t+1) - values_plus1.select(1, t))
             v_traces.append(values_plus1.select(1,t) + delta + gamma*cs*(next_v_trace - values_plus1.select(1,t)))
+
+            advantages.append(rho_t *(reward.select(1,t) + gamma*next_v_trace - values_plus1.select(1, t)))
 
             next_v_trace = v_traces[-1]
 
         v_traces.reverse()
+        advantages.reverse()
+        advantages = torch.stack(advantages, dim=1).to(device)
+        value_tensor = torch.stack(values, dim=1).float().to(device)
+        v_trace_tensor = torch.stack(v_traces, dim=1).float().to(device)
+
+        #print("advantages {}".format(advantages.shape))
 
         #calculate losses (probably redo all of this, it sucks)
         #value loss
-        value_tensor = torch.stack(values, dim=1).float().to(device)
-        v_trace_tensor = torch.stack(v_traces, dim=1).float().to(device)
         value_loss = l2_loss(value_tensor, v_trace_tensor)
 
         #policy loss
-        flat_action = torch.flatten(action, 0, 1)
-        flat_learner_probs = torch.flatten(learner_probs, 0, 1)
-        cross_entropy = F.cross_entropy(flat_learner_probs, flat_action.squeeze(1), reduction="none")
-        cross_entropy = cross_entropy.view_as(v_trace_tensor)
-        policy_loss = torch.mean(cross_entropy * v_trace_tensor.detach())
+        flat_action = torch.flatten(action, 0, 1).squeeze()
+        flat_learner_logits = torch.flatten(learner_logits, 0, 1)
+        cross_entropy = F.nll_loss(F.log_softmax(flat_learner_logits, dim=-1), target=flat_action, reduction="none")
+        cross_entropy = cross_entropy.view_as(advantages)
+        policy_loss = torch.sum(cross_entropy * advantages.detach())
 
         #entropy loss
-        entropy_loss = 0.0006 * torch.mean(F.softmax(learner_probs, dim=-1) * F.log_softmax(learner_probs, dim=-1))
+        entropy_loss = 0.0006 * torch.sum(F.softmax(learner_logits, dim=-1) * F.log_softmax(learner_logits, dim=-1))
 
 
         total_loss = value_loss * value_loss_scaler + policy_loss * policy_loss_scaler + entropy_loss * entropy_loss_scaler
@@ -204,7 +217,16 @@ def learner(v_network:NeuralNet, p_network:NeuralNet, game:str, tqueue: mp.Queue
         #update parameters
         optimizer.zero_grad()
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(list(p_network.parameters()) + list(v_network.parameters()), 40)
         optimizer.step()
+
+        #update actors (this should have its own hyperparameter
+        if i % 2 == 0:
+            for q in mqueues:
+                while not q.empty():
+                    try: q.get_nowait()
+                    except: pass
+                q.put(p_network.state_dict())
 
 
 
@@ -241,7 +263,7 @@ class Impala:
         self.learning_rate = 0.0006
         self.gamma = 0.99
         self.batch_size = 32
-        self.actor_num = 2
+        self.actor_num = 10
         self.learner_num = 1
         self.max_queue_size = 1000
 

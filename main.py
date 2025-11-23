@@ -10,7 +10,7 @@ from MiscUtil import Preprocessor
 
 if __name__ == '__main__':
     #global hyperparameters
-    episodes = 100
+    episodes = 1000
     max_steps = 1000
     n_action_repeats = 4
     stack_n_frames = 4

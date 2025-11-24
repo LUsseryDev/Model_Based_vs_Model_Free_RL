@@ -175,7 +175,8 @@ def learner(v_network:NeuralNet, p_network:NeuralNet, game:str, tqueue: mp.Queue
 
         #calculate V-trace targets and losses
         for t in reversed(range(trajectory_length)):
-            ratio = F.log_softmax(learner_logits, dim=-1).select(1, t).gather(1, action.select(1, t)) / F.log_softmax(actor_logits, dim=-1).select(1, t).gather(1, action.select(1, t))
+            ratio = F.log_softmax(learner_logits, dim=-1).select(1, t).gather(1, action.select(1, t)) - F.log_softmax(actor_logits, dim=-1).select(1, t).gather(1, action.select(1, t))
+            ratio = torch.exp(ratio)
             rho_t = torch.clamp(ratio, max=rho_threshold)
             cs = torch.clamp(ratio, max=c_threshold)
             delta = rho_t *(reward.select(1,t) + gamma*values_plus1.select(1, t+1) - values_plus1.select(1, t))

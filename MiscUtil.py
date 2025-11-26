@@ -28,9 +28,5 @@ class Preprocessor:
         return np.stack(self.prev_frames)
 
 def clip_reward(reward):
-    if reward > 0:
-        return 1
-    elif reward < 0:
-        return -1
-    return 0
+    return np.sign(reward)
 

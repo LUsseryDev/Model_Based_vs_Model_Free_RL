@@ -14,27 +14,30 @@ class NeuralNet(torch.nn.Module):
     def __init__(self, input_size, action_space):
         super(NeuralNet, self).__init__()
         self.network = torch.nn.Sequential(
-            torch.nn.Conv2d(in_channels=input_size, out_channels=16, kernel_size=8, stride=4),
-            torch.nn.ReLU(),
-            torch.nn.Conv2d(in_channels=16, out_channels=32, kernel_size=4, stride=2),
-            torch.nn.ReLU(),
+            torch.nn.Conv2d(in_channels=input_size, out_channels=32, kernel_size=8, stride=4),
+            torch.nn.LeakyReLU(),
+            torch.nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2),
+            torch.nn.LeakyReLU(),
+            torch.nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1),
+            torch.nn.LeakyReLU(),
             torch.nn.Flatten(1),
-            torch.nn.Linear(in_features=5632, out_features=256),
-            torch.nn.ReLU(),
-            torch.nn.Linear(in_features=256, out_features=256),
-            torch.nn.ReLU(),
+            torch.nn.Linear(in_features=8064, out_features=512),
+            torch.nn.LeakyReLU(),
+            torch.nn.Linear(in_features=512, out_features=256),
+            torch.nn.LeakyReLU(),
             torch.nn.Linear(in_features=256, out_features=action_space)
         )
 
     def forward(self, x):
         return self.network(x)
 
-def actor(game:str, tqueue: mp.Queue, mqueue: mp.Queue, is_done:mp.Event(), is_paused:mp.Event(), trajectory_length:int, stack_n_frames:int, n_action_repeats:int):
+def actor(game:str, tqueue: mp.Queue, mqueue: mp.Queue, is_done:mp.Event(), is_paused:mp.Event(), trajectory_length:int, stack_n_frames:int, n_action_repeats:int, batch_size:int):
     process = mp.current_process()
     print("starting actor with pid "+str(process.pid))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     env = EnvUtil.getEnvList([game])[0]
-    network = NeuralNet(stack_n_frames, env.action_space.n).to(device)
+    network = NeuralNet(stack_n_frames, env.action_space.n)
+    torch.set_num_threads(1)
 
 
     frame, info = env.reset()
@@ -58,7 +61,7 @@ def actor(game:str, tqueue: mp.Queue, mqueue: mp.Queue, is_done:mp.Event(), is_p
         for i in range(trajectory_length):
             # get action
             with torch.no_grad():
-                action_probs = network.forward(torch.from_numpy(obs).float().unsqueeze(0).to(device)).cpu().detach()
+                action_probs = network.forward(torch.from_numpy(obs).float().unsqueeze(0))
                 try: action = torch.multinomial(torch.nn.functional.softmax(action_probs, dim=1), 1)
                 except:
                     print("broke")
@@ -66,9 +69,11 @@ def actor(game:str, tqueue: mp.Queue, mqueue: mp.Queue, is_done:mp.Event(), is_p
                     raise RuntimeError
 
             # run action and save to trajectory
+            reward = 0
             for j in range(n_action_repeats - 1):
-                env.step(action)
-            next_frame, reward, terminated, truncated, info = env.step(action)
+                reward += env.step(action)[1]
+            next_frame, r, terminated, truncated, info = env.step(action)
+            reward += r
 
             obs_trajectory.append(obs)
             reward_trajectory.append(clip_reward(reward))
@@ -88,6 +93,8 @@ def actor(game:str, tqueue: mp.Queue, mqueue: mp.Queue, is_done:mp.Event(), is_p
         reward_trajectory = np.stack(reward_trajectory)
         logit_trajectory = np.stack(logit_trajectory)
 
+        # while tqueue.qsize() > batch_size*5:
+        #     time.sleep(0.1)
         tqueue.put({"obs":obs_trajectory, "action":action_trajectory, "reward":reward_trajectory, "logits":logit_trajectory})
 
 
@@ -104,24 +111,26 @@ def actor(game:str, tqueue: mp.Queue, mqueue: mp.Queue, is_done:mp.Event(), is_p
                 env.close()
                 return
 
-def learner(v_network:NeuralNet, p_network:NeuralNet, game:str, tqueue: mp.Queue, mqueues: list[mp.Queue], is_done:mp.Event(), is_paused:mp.Event(), trajectory_length:int, stack_n_frames:int, n_action_repeats:int, episodes:int, print_freq:int, batch_size:int, gamma:float) -> (NeuralNet, NeuralNet):
+def learner(v_network:NeuralNet, p_network:NeuralNet, game:str, tqueue: mp.Queue, mqueues: list[mp.Queue], is_done:mp.Event(), is_paused:mp.Event(), trajectory_length:int, episodes:int, print_freq:int, batch_size:int, gamma:float) -> (NeuralNet, NeuralNet):
     process = mp.current_process()
     print("starting learner with pid "+str(process.pid))
+    torch.set_num_threads(1)
     env = EnvUtil.getEnvList([game])[0]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     v_network.to(device)
     p_network.to(device)
     l2_loss = torch.nn.MSELoss()
 
+
     #hyperparamters
     #move these somewhere else
     rho_threshold = 1
     c_threshold = 1
-    value_loss_scaler = 1
+    value_loss_scaler = 0.5
     policy_loss_scaler = 1
-    entropy_loss_scaler = 1
+    entropy_loss_scaler = 0.01
 
-    optimizer = torch.optim.Adam(list(v_network.parameters()) + list(p_network.parameters()), lr=0.0006)
+    optimizer = torch.optim.RMSprop(list(v_network.parameters()) + list(p_network.parameters()), lr=0.0006, momentum=0.0, eps=0.01)
 
     rewards = []
     losses = []
@@ -133,8 +142,10 @@ def learner(v_network:NeuralNet, p_network:NeuralNet, game:str, tqueue: mp.Queue
         for _ in range(batch_size):
             #if queue empty, wait
             while tqueue.empty():
+                print("empty q")
                 time.sleep(1)
-            batch.append(tqueue.get())
+
+            batch.append(tqueue.get(timeout=0.1))
 
         batch_obs = []
         batch_action = []
@@ -157,20 +168,22 @@ def learner(v_network:NeuralNet, p_network:NeuralNet, game:str, tqueue: mp.Queue
 
 
         #do some learning
-        values = [v_network(obs.select(1, j)) for j in range(trajectory_length)]
-        learner_logits = [p_network(obs.select(1, j)) for j in range(trajectory_length)]
 
-        learner_logits = torch.stack(learner_logits, dim=1).to(device)
+        #merge batch and trajectory dimensions to make it faster
+        obs_merged = obs.view(batch_size * trajectory_length, obs.shape[2], obs.shape[3], obs.shape[4])
 
-        #print("learner: " + str(learner_logits.select(1, 0).shape))
+        values_merged = v_network.forward(obs_merged)
+        learner_logits_merged = p_network.forward(obs_merged)
+
+        values = values_merged.view(batch_size, trajectory_length, 1)
+        learner_logits = learner_logits_merged.view(batch_size, trajectory_length, -1)
 
         #used to start recursive v-trace calcs
-        next_v_trace = values[-1]
-        v_traces = []
-        values_plus1 = values.copy()
-        values_plus1.append(values[-1])
-        values_plus1 = torch.stack(values_plus1, dim=1).to(device)
+        next_v_trace = values[:,-1:]
+        values_plus1 = torch.cat((values, next_v_trace), dim=1)
+        next_v_trace = next_v_trace.squeeze(2)
 
+        v_traces = []
         advantages = []
 
         #calculate V-trace targets and losses
@@ -189,13 +202,16 @@ def learner(v_network:NeuralNet, p_network:NeuralNet, game:str, tqueue: mp.Queue
         v_traces.reverse()
         advantages.reverse()
         advantages = torch.stack(advantages, dim=1).to(device)
-        value_tensor = torch.stack(values, dim=1).float().to(device)
+
+        #value_tensor = torch.stack(values, dim=1).float().to(device)
+        value_tensor = values
+
         v_trace_tensor = torch.stack(v_traces, dim=1).float().to(device)
 
-        #print("advantages {}".format(advantages.shape))
-
-        #calculate losses (probably redo all of this, it sucks)
+        #calculate losses
         #value loss
+        # print(value_tensor.shape)
+        # print(v_trace_tensor.shape)
         value_loss = l2_loss(value_tensor, v_trace_tensor)
 
         #policy loss
@@ -206,7 +222,7 @@ def learner(v_network:NeuralNet, p_network:NeuralNet, game:str, tqueue: mp.Queue
         policy_loss = torch.sum(cross_entropy * advantages.detach())
 
         #entropy loss
-        entropy_loss = 0.0006 * torch.sum(F.softmax(learner_logits, dim=-1) * F.log_softmax(learner_logits, dim=-1))
+        entropy_loss = torch.sum(F.softmax(learner_logits, dim=-1) * F.log_softmax(learner_logits, dim=-1))
 
 
         total_loss = value_loss * value_loss_scaler + policy_loss * policy_loss_scaler + entropy_loss * entropy_loss_scaler
@@ -260,13 +276,13 @@ class Impala:
         self.print_freq = print_freq
 
         #impala specific hyperparameters
-        self.trajectory_length = 40
+        self.trajectory_length = 20
         self.learning_rate = 0.0006
         self.gamma = 0.99
         self.batch_size = 32
-        self.actor_num = 10
+        self.actor_num = 10 #adjust based on number of cpu cores
         self.learner_num = 1
-        self.max_queue_size = 1000
+        self.max_queue_size = self.batch_size*10
 
         #global objects
         self.p_network = NeuralNet(self.stack_n_frames, self.env.action_space.n)
@@ -353,13 +369,13 @@ class Impala:
         keyboard.on_press_key('p', self.pause)
 
         queues = [mp.Queue() for _ in range(self.actor_num)]
-        actors = [mp.Process(target=actor, args=[self.game, self.trajectory_queue, queues[i], self.is_done, self.is_paused, self.trajectory_length, self.stack_n_frames, self.n_action_repeats]) for i in range(self.actor_num)]
+        actors = [mp.Process(target=actor, args=[self.game, self.trajectory_queue, queues[i], self.is_done, self.is_paused, self.trajectory_length, self.stack_n_frames, self.n_action_repeats, self.batch_size]) for i in range(self.actor_num)]
         for a in actors:
             a.start()
 
         time.sleep(2)
 
-        self.p_network, self.v_network = learner(self.v_network, self.p_network, self.game, self.trajectory_queue, queues, self.is_done, self.is_paused, self.trajectory_length, self.stack_n_frames, self.n_action_repeats, self.episodes, self.print_freq, self.batch_size, self.gamma)
+        self.p_network, self.v_network = learner(self.v_network, self.p_network, self.game, self.trajectory_queue, queues, self.is_done, self.is_paused, self.trajectory_length, self.episodes, self.print_freq, self.batch_size, self.gamma)
         print("\nTraining finished")
         self.is_done.set()
 
@@ -371,6 +387,6 @@ class Impala:
         return
 
     def save(self):
-        return
+        torch.save(self.p_network.state_dict(), "impala_"+self.game+".pt")
     def load(self):
         return

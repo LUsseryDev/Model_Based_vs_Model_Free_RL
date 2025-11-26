@@ -17,7 +17,8 @@ if __name__ == '__main__':
     obs_size = (106, 140)
     print_freq = 10
 
-    algorithm_list = ["Impala", "RandomAction"]
+    #algorithm_list = ["Impala", "RandomAction"]
+    algorithm_list = ["Impala"]
     algorithm_objects = []
 
     #if there are command line arguments, use the arguments instead of interaction with user
@@ -37,6 +38,7 @@ if __name__ == '__main__':
             match choice:
                 case '1':
                     gameList = chooseGames()
+                    gameList = ["Asteroids"]
 
                     #print(gameList)
                     for game in gameList:

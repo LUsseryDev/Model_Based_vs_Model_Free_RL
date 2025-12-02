@@ -1,4 +1,5 @@
 import sys
+import time
 
 import gymnasium
 
@@ -10,7 +11,7 @@ from MiscUtil import Preprocessor
 
 if __name__ == '__main__':
     #global hyperparameters
-    episodes = 100000
+    episodes = 50000
     max_steps = 1000
     n_action_repeats = 4
     stack_n_frames = 4
@@ -38,7 +39,7 @@ if __name__ == '__main__':
             match choice:
                 case '1':
                     gameList = chooseGames()
-                    gameList = ["Asteroids"]
+                    gameList = ["Asteroids", "Boxing", "Krull" "Pong"]
 
                     #print(gameList)
                     for game in gameList:
@@ -46,10 +47,12 @@ if __name__ == '__main__':
                         for alg in algorithm_list:
                             a = cls = globals()[alg](game, episodes, max_steps, stack_n_frames, n_action_repeats, print_freq)
                             print("starting {}".format(a.__str__()))
+                            start = time.perf_counter()
                             a.train()
+                            end = time.perf_counter()
                             a.save()
                             algorithm_objects.append(a)
-                            print("{} done".format(a.__str__()))
+                            print("{} done, training time was {} seconds".format(a.__str__(), str(end - start)))
 
                         # rand = RandomAction("Asteroids", episodes, max_steps, stack_n_frames, n_action_repeats, print_freq)
                         # rand.train()

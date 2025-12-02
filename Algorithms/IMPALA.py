@@ -99,10 +99,21 @@ def actor(game:str, tqueue: mp.Queue, mqueue: mp.Queue, is_done:mp.Event, is_pau
     torch.set_num_threads(1)
 
 
-    frame, info = env.reset()
+    env.reset()
+
+
+    #random action for a few frames
+    init_frames = 30
+    for _ in range(init_frames):
+        action = env.action_space.sample()
+        for _ in range(n_action_repeats-1):
+            env.step(action)
+
+    frame, reward, terminated, truncated, info = env.step(env.action_space.sample())
     preprocessor = Preprocessor(frame, stack_n_frames)
     obs = preprocessor.get_obs(frame)
     lives = info['lives']
+
 
     #main loop
     while True:
@@ -134,6 +145,10 @@ def actor(game:str, tqueue: mp.Queue, mqueue: mp.Queue, is_done:mp.Event, is_pau
             next_frame, r, terminated, truncated, info = env.step(action)
             reward += r
 
+            #please stop flying into the asteroids
+            # if terminated or truncated:
+            #     reward = 0
+
 
             obs_trajectory.append(obs)
             reward_trajectory.append(clip_reward(reward))
@@ -143,7 +158,12 @@ def actor(game:str, tqueue: mp.Queue, mqueue: mp.Queue, is_done:mp.Event, is_pau
             #ready for next step
             obs = preprocessor.get_obs(next_frame)
             if lives != info['lives'] or terminated or truncated:
-                frame, info = env.reset()
+                env.reset()
+                for _ in range(init_frames):
+                    action = env.action_space.sample()
+                    for _ in range(n_action_repeats - 1):
+                        env.step(action)
+                frame, reward, terminated, truncated, info = env.step(env.action_space.sample())
                 preprocessor = Preprocessor(frame, stack_n_frames)
                 obs = preprocessor.get_obs(frame)
                 lives = info['lives']
@@ -351,7 +371,7 @@ class Impala:
         self.learning_rate = 0.0006
         self.gamma = 0.99
         self.batch_size = 32
-        self.actor_num = 15 #adjust based on number of cpu cores
+        self.actor_num = 14 #adjust based on number of cpu cores
         self.learner_num = 1
         self.max_queue_size = 1000
 
@@ -373,11 +393,11 @@ class Impala:
         self.is_paused.set()
 
         print("\nPaused")
-        print("input \"1\" to quit, input anything else to continue (that doesn't start with \'p\')")
+        print("input \"1\" to quit, input anything else to continue (that doesn't start with \'`\')")
         choice = input("Enter your choice: ")
 
         # this is stupid, thank you input buffer
-        choice = choice.lstrip("p")
+        choice = choice.lstrip("`")
 
         if choice == "1":
             self.save()
@@ -388,7 +408,7 @@ class Impala:
 
     def run(self):
 
-        keyboard.on_press_key('p', self.pause)
+        keyboard.on_press_key('`', self.pause)
 
         rewards = []
         for i in range(self.episodes):  # loop per episode
@@ -436,7 +456,7 @@ class Impala:
             #     self.paused = False
 
     def train(self):
-        keyboard.on_press_key('p', self.pause)
+        keyboard.on_press_key('`', self.pause)
 
         queues = [mp.Queue() for _ in range(self.actor_num)]
         actors = [mp.Process(target=actor, args=[self.game, self.trajectory_queue, queues[i], self.is_done, self.is_paused, self.trajectory_length, self.stack_n_frames, self.n_action_repeats, self.batch_size]) for i in range(self.actor_num)]

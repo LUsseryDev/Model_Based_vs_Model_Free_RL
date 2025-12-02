@@ -1,4 +1,5 @@
 import time
+from copy import deepcopy
 
 import keyboard
 import torch
@@ -10,27 +11,83 @@ import torch.multiprocessing as mp
 from torch.nn import functional as F
 
 
+# class NeuralNet(torch.nn.Module):
+#     def __init__(self, input_size, action_space):
+#         super(NeuralNet, self).__init__()
+#         self.common = torch.nn.Sequential(
+#             torch.nn.Conv2d(in_channels=input_size, out_channels=32, kernel_size=8, stride=4),
+#             torch.nn.LeakyReLU(),
+#             torch.nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2),
+#             torch.nn.LeakyReLU(),
+#             torch.nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1),
+#             torch.nn.LeakyReLU(),
+#             torch.nn.Flatten(1),
+#             torch.nn.Linear(in_features=8064, out_features=512),
+#             torch.nn.LeakyReLU(),
+#             torch.nn.Linear(in_features=512, out_features=256),
+#             torch.nn.LeakyReLU()
+#         )
+#         self.policy = torch.nn.Linear(256, action_space)
+#         self.value = torch.nn.Linear(256, 1)
+#
+#     def forward(self, x):
+#         x = self.common(x)
+#         return self.policy(x), self.value(x)
+
 class NeuralNet(torch.nn.Module):
     def __init__(self, input_size, action_space):
         super(NeuralNet, self).__init__()
-        self.common = torch.nn.Sequential(
-            torch.nn.Conv2d(in_channels=input_size, out_channels=32, kernel_size=8, stride=4),
+        self.conv_blocks = []
+        self.res_blocks1 = []
+        self.res_blocks2 = []
+
+        in_ch = input_size
+        for out_ch in [16, 32, 32]:
+            block = []
+            block.append(torch.nn.Conv2d(in_channels=in_ch, out_channels=out_ch, kernel_size=3, stride=1))
+            block.append(torch.nn.MaxPool2d(kernel_size=3, stride=2))
+            self.conv_blocks.append(torch.nn.Sequential(*block))
+
+            in_ch = out_ch
+
+            for i in range(2):
+                res = []
+                res.append(torch.nn.LeakyReLU())
+                res.append(torch.nn.Conv2d(in_channels=in_ch, out_channels=out_ch, kernel_size=3, stride=1, padding=1))
+                res.append(torch.nn.LeakyReLU())
+                res.append(torch.nn.Conv2d(in_channels=in_ch, out_channels=out_ch, kernel_size=3, stride=1, padding=1))
+
+                if i == 0:
+                    self.res_blocks1.append(torch.nn.Sequential(*res))
+                else:
+                    self.res_blocks2.append(torch.nn.Sequential(*res))
+
+        self.conv_blocks = torch.nn.ModuleList(self.conv_blocks)
+        self.res_blocks1 = torch.nn.ModuleList(self.res_blocks1)
+        self.res_blocks2 = torch.nn.ModuleList(self.res_blocks2)
+
+        self.linear = torch.nn.Sequential(
             torch.nn.LeakyReLU(),
-            torch.nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2),
+            torch.nn.Linear(in_features=4480, out_features=256),
             torch.nn.LeakyReLU(),
-            torch.nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1),
+            torch.nn.Linear(in_features=256, out_features=256),
             torch.nn.LeakyReLU(),
-            torch.nn.Flatten(1),
-            torch.nn.Linear(in_features=8064, out_features=512),
-            torch.nn.LeakyReLU(),
-            torch.nn.Linear(in_features=512, out_features=256),
-            torch.nn.LeakyReLU()
         )
         self.policy = torch.nn.Linear(256, action_space)
         self.value = torch.nn.Linear(256, 1)
 
     def forward(self, x):
-        x = self.common(x)
+        for i in range(len(self.conv_blocks)):
+            x = self.conv_blocks[i](x)
+            res_x = x
+            x = self.res_blocks1[i](x)
+            x += res_x
+            res_x = x
+            x = self.res_blocks2[i](x)
+            x += res_x
+
+        x = torch.flatten(x, 1)
+        x = self.linear(x)
         return self.policy(x), self.value(x)
 
 def actor(game:str, tqueue: mp.Queue, mqueue: mp.Queue, is_done:mp.Event, is_paused:mp.Event, trajectory_length:int, stack_n_frames:int, n_action_repeats:int, batch_size:int):
@@ -77,6 +134,7 @@ def actor(game:str, tqueue: mp.Queue, mqueue: mp.Queue, is_done:mp.Event, is_pau
             next_frame, r, terminated, truncated, info = env.step(action)
             reward += r
 
+
             obs_trajectory.append(obs)
             reward_trajectory.append(clip_reward(reward))
             action_trajectory.append(action)
@@ -122,6 +180,9 @@ def learner(network:NeuralNet, game:str, tqueue: mp.Queue, mqueues: list[mp.Queu
     network.to(device)
     l2_loss = torch.nn.MSELoss()
 
+    best_state_dict = deepcopy(network.state_dict())
+    best_reward = 0
+
     #hyperparamters
     #move these somewhere else
     rho_threshold = 1
@@ -143,9 +204,9 @@ def learner(network:NeuralNet, game:str, tqueue: mp.Queue, mqueues: list[mp.Queu
         batch = []
         for _ in range(batch_size):
             #if queue empty, wait
-            # while tqueue.empty():
-            #     print("empty q")
-            #     time.sleep(1)
+            while tqueue.empty():
+                #print("empty q")
+                time.sleep(0.5)
             batch.append(tqueue.get(timeout=0.5))
 
         batch_obs = []
@@ -252,18 +313,28 @@ def learner(network:NeuralNet, game:str, tqueue: mp.Queue, mqueues: list[mp.Queu
             print("Trajectory {} | T-queue size {} | Avg. Loss {} | Avg. Reward {:.3f}".format(i, tqueue.qsize(), np.mean(losses[-print_freq:]), torch.mean(torch.stack(rewards[-print_freq:]))))
             #print("Value Loss {} | Policy Loss {} | Entropy Loss {}".format(value_loss.item(), policy_loss.item(), entropy_loss.item()))
 
+            #this should be in its own if statement, and it should actually evaluate the model instead of just using training rewards
+            if torch.mean(torch.stack(rewards[-print_freq:])) > best_reward:
+                best_reward = torch.mean(torch.stack(rewards[-print_freq:]))
+                best_state_dict = deepcopy(network.state_dict())
+                torch.save(best_state_dict, "impala2_" + game + ".pt")
+                print("new best")
+
+
         if is_done.is_set():
             env.close()
+            network.load_state_dict(best_state_dict)
             return network
 
         while is_paused.is_set():
             time.sleep(2)
             if is_done.is_set():
                 env.close()
+                network.load_state_dict(best_state_dict)
                 return network
     env.close()
+    network.load_state_dict(best_state_dict)
     return network
-
 
 class Impala:
     def __init__(self, game:str, episodes: int, max_steps: int, stack_n_frames: int, n_action_repeats: int, print_freq: int):
@@ -280,9 +351,9 @@ class Impala:
         self.learning_rate = 0.0006
         self.gamma = 0.99
         self.batch_size = 32
-        self.actor_num = 14 #adjust based on number of cpu cores
+        self.actor_num = 15 #adjust based on number of cpu cores
         self.learner_num = 1
-        self.max_queue_size = self.batch_size*100
+        self.max_queue_size = 1000
 
         #global objects
         self.network = NeuralNet(self.stack_n_frames, self.env.action_space.n)

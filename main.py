@@ -10,12 +10,12 @@ from MiscUtil import Preprocessor
 
 if __name__ == '__main__':
     #global hyperparameters
-    episodes = 1000
+    episodes = 100000
     max_steps = 1000
     n_action_repeats = 4
     stack_n_frames = 4
     obs_size = (106, 140)
-    print_freq = 10
+    print_freq = 100
 
     #algorithm_list = ["Impala", "RandomAction"]
     algorithm_list = ["Impala"]

@@ -1,10 +1,7 @@
 import time
 from copy import deepcopy
-
 import keyboard
 import torch
-import gymnasium as gym
-
 import EnvUtil
 from MiscUtil import *
 import torch.multiprocessing as mp
@@ -172,17 +169,12 @@ def actor(game:str, tqueue: mp.Queue, mqueue: mp.Queue, is_done:mp.Event, is_pau
         action_trajectory = torch.from_numpy(np.stack(action_trajectory)).to(device)
         reward_trajectory = torch.from_numpy(np.stack(reward_trajectory)).to(device)
         logit_trajectory = torch.from_numpy(np.stack(logit_trajectory)).to(device)
-
-        # while tqueue.qsize() > batch_size*5:
-        #     time.sleep(0.1)
         tqueue.put({"obs":obs_trajectory, "action":action_trajectory, "reward":reward_trajectory, "logits":logit_trajectory})
-
 
         if is_done.is_set():
             tqueue.cancel_join_thread()
             env.close()
             return
-
 
         while is_paused.is_set():
             time.sleep(2)
@@ -246,15 +238,9 @@ def learner(network:NeuralNet, game:str, tqueue: mp.Queue, mqueues: list[mp.Queu
 
         rewards.append(torch.mean(reward.float()))
 
-
-
-        #do some learning
-
         #merge batch and trajectory dimensions to make it faster
         obs_merged = obs.view(batch_size * trajectory_length, obs.shape[2], obs.shape[3], obs.shape[4])
-
         learner_logits_merged, values_merged = network.forward(obs_merged)
-
         values = values_merged.view(batch_size, trajectory_length, 1)
         learner_logits = learner_logits_merged.view(batch_size, trajectory_length, -1)
 

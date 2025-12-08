@@ -1,6 +1,3 @@
-import gymnasium as gym
-from gymnasium import Env
-
 import EnvUtil
 from MiscUtil import *
 import keyboard
